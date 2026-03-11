@@ -298,10 +298,10 @@ class PetParser:
             # Duel Mode
             if "duel" in field_name:
                 field_value_lower = field_value.lower()
-                if "active" in field_value_lower:
-                    duel_mode = True
-                elif "inactive" in field_value_lower:
+                if "inactive" in field_value_lower:
                     duel_mode = False
+                elif "active" in field_value_lower:
+                    duel_mode = True
         
         # Check description and title for server ID if not found
         if not server_id:
