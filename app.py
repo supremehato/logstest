@@ -96,7 +96,7 @@ class Job:
     retry_delay: int
     created_time: float
     is_priority: bool = False
-    duel_mode: Optional[str] = None  # NEW: "Yes", "No", or None if unknown
+    duel_mode: Optional[bool] = None  # True = Active, False = Inactive, None = not present
     
     def format_value(self) -> str:
         """Format pet value as K/M/B with /s"""
@@ -109,9 +109,19 @@ class Job:
         else:
             return f"${self.pet_value:.2f}/s"
     
+    def format_duel(self) -> str:
+        """Format duel mode for logging"""
+        if self.duel_mode is True:
+            return "Duel: ✅ Active"
+        elif self.duel_mode is False:
+            return "Duel: ❌ Inactive"
+        else:
+            return "Duel: ➖ N/A"
+    
     def to_dict(self):
         data = asdict(self)
         data['pet_value_formatted'] = self.format_value()
+        data['duel_mode_label'] = self.format_duel()
         return data
 
 
@@ -260,26 +270,11 @@ class PetParser:
         )
     
     @classmethod
-    def parse_duel_mode(cls, fields: list) -> Optional[str]:
-        """Parse duel mode from embed fields. Returns 'Yes', 'No', or None."""
-        for field in fields:
-            field_name = field.get("name", "").lower()
-            if "duel" in field_name:
-                raw = cls.clean_text(field.get("value", ""))
-                # Check inactive BEFORE active to avoid substring match bug
-                if "inactive" in raw.lower() or "❌" in raw:
-                    return "No"
-                elif "✅" in raw or raw.lower() == "active":
-                    return "Yes"
-                else:
-                    return "No"
-        return None
-
-    @classmethod
     def parse_embed(cls, embed_dict: dict) -> Dict:
         """Parse embed from Gateway JSON format - returns ALL pets found (priority and non-priority) as separate entries"""
         server_id = None
         pet_thumbnail = None
+        duel_mode = None  # None = not present, True = Active, False = Inactive
         
         # Extract thumbnail
         if embed_dict.get("thumbnail") and embed_dict["thumbnail"].get("url"):
@@ -288,15 +283,25 @@ class PetParser:
         # Extract fields
         fields = embed_dict.get("fields", [])
         
-        # Find server ID
+        # Find server ID and duel mode in fields
         for field in fields:
             field_name = field.get("name", "").lower()
             field_value = cls.clean_text(field.get("value", ""))
             
-            if ("server" in field_name and "id" in field_name) or \
-               ("job" in field_name and "id" in field_name):
+            # Server ID
+            if not server_id and (
+                ("server" in field_name and "id" in field_name) or
+                ("job" in field_name and "id" in field_name)
+            ):
                 server_id = field_value
-                break
+
+            # Duel Mode
+            if "duel" in field_name:
+                field_value_lower = field_value.lower()
+                if "active" in field_value_lower:
+                    duel_mode = True
+                elif "inactive" in field_value_lower:
+                    duel_mode = False
         
         # Check description and title for server ID if not found
         if not server_id:
@@ -306,9 +311,6 @@ class PetParser:
                     server_id = match.group()
                     break
         
-        # NEW: Parse duel mode
-        duel_mode = cls.parse_duel_mode(fields)
-
         # Find ALL pets (both priority and non-priority) - send each as separate job
         all_pets_found: Dict[str, Dict] = {}  # pet_name -> {value, name}
         
@@ -319,11 +321,9 @@ class PetParser:
                 field_value = cls.clean_text(field.get("value", ""))
                 name, value = cls.extract_pet_from_line(field_value)
                 if name and value > 0:
-                    # Use exact name as key to preserve all pets
                     if name not in all_pets_found:
                         all_pets_found[name] = {"value": value, "name": name}
                     else:
-                        # Keep highest value if same pet appears multiple times
                         all_pets_found[name]["value"] = max(
                             all_pets_found[name]["value"], value
                         )
@@ -344,11 +344,9 @@ class PetParser:
                     if not name or value == 0:
                         continue
                     
-                    # Use exact name as key - keep ALL pets separately
                     if name not in all_pets_found:
                         all_pets_found[name] = {"value": value, "name": name}
                     else:
-                        # Keep highest value if same pet appears multiple times
                         all_pets_found[name]["value"] = max(
                             all_pets_found[name]["value"], value
                         )
@@ -358,13 +356,11 @@ class PetParser:
         all_pets_list: List[PetInfo] = []
         
         if all_pets_found:
-            # Sort: priority pets first (by priority order), then non-priority pets
             priority_pets = []
             regular_pets = []
             
             for pet_name, pet_data in all_pets_found.items():
                 pet_name_lower = pet_name.lower()
-                # Check if it's in priority list
                 matched_priority = next(
                     (p for p in PRIORITY_PETS if p.lower() == pet_name_lower),
                     None
@@ -382,10 +378,8 @@ class PetParser:
                 else:
                     regular_pets.append(pet_info)
             
-            # Sort priority pets by priority order (lowest index = highest priority)
             priority_pets.sort(key=lambda x: PRIORITY_PETS_INDEX.get(x[0].lower(), len(PRIORITY_PETS)))
             
-            # Add priority pets first, then regular pets
             for _, pet_info in priority_pets:
                 all_pets_list.append(pet_info)
             
@@ -394,8 +388,8 @@ class PetParser:
         
         return {
             "server_id": server_id,
-            "pet_info_list": all_pets_list,  # ALL pets, not just priority
-            "duel_mode": duel_mode  # NEW
+            "pet_info_list": all_pets_list,
+            "duel_mode": duel_mode  # True / False / None
         }
 
 
@@ -416,31 +410,28 @@ class JobQueueManager:
     def add_job(self, job: Job, unique_tracking_id: Optional[str] = None) -> bool:
         """Add job to queue, updating if better value exists for same pet+server combo"""
         with self.lock:
-            # Use unique_tracking_id if provided, otherwise fall back to server_id
             tracking_id = unique_tracking_id or job.server_id
             
-            # Check for existing job with same server_id AND pet_name (same pet from same server)
             for idx, existing_job in enumerate(self.queue):
                 if existing_job.server_id == job.server_id and existing_job.pet_name == job.pet_name:
                     if job.pet_value > existing_job.pet_value:
-                        # Remove old job and add new one
                         del self.queue[idx]
                         self.queue.append(job)
                         logger.info(
                             f"🔄 Updated job {job.server_id[:8]}... "
                             f"{existing_job.pet_name} → {job.pet_name} "
-                            f"({job.format_value()})"
+                            f"({job.format_value()}) | {job.format_duel()}"
                         )
                         return True
                     return False
             
-            # Add new job (allows multiple pets from same server with same server_id)
+            # Add new job
             self.queue.append(job)
-            self.sent_servers.add(tracking_id)  # Track by unique_tracking_id if provided
-            duel_tag = f" ⚔️ DUEL" if job.duel_mode == "Yes" else ""
+            self.sent_servers.add(tracking_id)
             logger.info(
                 f"🚀 NEW JOB: {job.server_id[:8]}... "
-                f"Pet: {job.pet_name} ({job.format_value()}){duel_tag} "
+                f"Pet: {job.pet_name} ({job.format_value()}) | "
+                f"{job.format_duel()} "
                 f"[Queue: {len(self.queue)}]"
             )
             return True
@@ -448,7 +439,6 @@ class JobQueueManager:
     def get_job_for_client(self, client_id: str, processed_servers: Set[str]) -> Optional[Job]:
         """Get next available job for client (only jobs created AFTER client loaded)"""
         with self.lock:
-            # Get client's connection time (default to 0 if not tracked)
             client_connect_time = client_connection_times.get(client_id, 0)
             
             for job in self.queue:
@@ -456,23 +446,16 @@ class JobQueueManager:
                 pet_name = job.pet_name
                 job_key = (server_id, pet_name)
                 
-                # Skip if already processed (check by server_id only for backward compatibility)
                 if server_id in processed_servers:
                     continue
                 
-                # Skip if this specific pet+server combo was already sent to this client
                 if job_key in self.job_sent_to_clients:
                     if client_id in self.job_sent_to_clients[job_key]:
                         continue
                 
-                # CRITICAL: Skip ALL jobs created BEFORE client loaded
-                # Only send jobs created AFTER client loaded (job.created_time > client_connect_time)
-                # If client loaded at time 100 and job created at time 200, send it (job is newer)
-                # If client loaded at time 200 and job created at time 100, skip it (job is older)
                 if client_connect_time > 0 and job.created_time <= client_connect_time:
-                    continue  # Skip old job - job was created before or at the same time client loaded
+                    continue
                 
-                # Mark as sent to this client (track by server_id + pet_name)
                 if job_key not in self.job_sent_to_clients:
                     self.job_sent_to_clients[job_key] = set()
                 self.job_sent_to_clients[job_key].add(client_id)
@@ -482,28 +465,24 @@ class JobQueueManager:
             return None
     
     def remove_job(self, server_id: str, pet_name: Optional[str] = None):
-        """Remove job from queue. If pet_name provided, remove only that specific pet. Otherwise remove all jobs with that server_id."""
+        """Remove job from queue."""
         with self.lock:
             if pet_name:
-                # Remove only the specific pet+server combo
                 self.queue = deque(
                     [j for j in self.queue if not (j.server_id == server_id and j.pet_name == pet_name)],
                     maxlen=self.queue.maxlen
                 )
             else:
-                # Remove all jobs with this server_id (backward compatibility)
                 self.queue = deque(
                     [j for j in self.queue if j.server_id != server_id],
                     maxlen=self.queue.maxlen
                 )
     
     def size(self) -> int:
-        """Get queue size"""
         with self.lock:
             return len(self.queue)
     
     def get_stats(self) -> Dict:
-        """Get queue statistics"""
         with self.lock:
             return {
                 "size": len(self.queue),
@@ -528,7 +507,6 @@ class ProcessedServersManager:
         self.last_cleanup = time.time()
     
     def add(self, server_id: str, client_id: str):
-        """Add processed server"""
         with self.lock:
             if server_id not in self.servers:
                 self.servers[server_id] = {
@@ -537,21 +515,16 @@ class ProcessedServersManager:
                 }
             self.servers[server_id]["clients"].add(client_id)
             
-            # Cleanup if needed
             if len(self.servers) > self.max_size:
                 self._cleanup()
     
     def contains(self, server_id: str) -> bool:
-        """Check if server is processed"""
         with self.lock:
-            # Periodic cleanup
-            if time.time() - self.last_cleanup > 300:  # Every 5 minutes
+            if time.time() - self.last_cleanup > 300:
                 self._cleanup()
-            
             return server_id in self.servers
     
     def _cleanup(self):
-        """Remove old entries"""
         cutoff = datetime.now() - timedelta(seconds=self.ttl)
         self.servers = {
             sid: data for sid, data in self.servers.items()
@@ -561,7 +534,6 @@ class ProcessedServersManager:
         logger.info(f"🧹 Cleaned up processed servers. Remaining: {len(self.servers)}")
     
     def size(self) -> int:
-        """Get count of processed servers"""
         with self.lock:
             return len(self.servers)
 
@@ -581,7 +553,6 @@ class DiscordBot:
         self.processed_servers = processed_servers
         self.processed_message_ids: Set[int] = set()
         
-        # Create bot with minimal intents
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guild_messages = True
@@ -589,43 +560,33 @@ class DiscordBot:
         self.bot = discord.Client(intents=intents)
         self.connected = False
         
-        # Set up event handlers
         self.bot.event(self.on_ready)
         self.bot.event(self.on_message)
     
     async def on_ready(self):
-        """Called when bot is ready"""
         self.connected = True
         logger.info(f"✅ Discord bot ready! Logged in as {self.bot.user}")
         logger.info(f"📡 Listening to channel ID: {self.channel_id}")
     
     async def on_message(self, message: discord.Message):
-        """Called when a message is received"""
-        # Only process messages from the target channel
         if message.channel.id != self.channel_id:
             return
         
-        # Skip if already processed
         if message.id in self.processed_message_ids:
             return
         
-        # Only process messages with embeds
         if not message.embeds:
             return
         
         self.processed_message_ids.add(message.id)
         
-        # Clean up old message IDs periodically
         if len(self.processed_message_ids) > Config.MAX_MESSAGE_IDS:
-            # Keep only recent IDs (simple cleanup)
             self.processed_message_ids = set(list(self.processed_message_ids)[-Config.MAX_MESSAGE_IDS:])
         
         logger.info(f"📨 Message with {len(message.embeds)} embed(s) (ID: {message.id})")
         
-        # Process embeds
         for idx, embed in enumerate(message.embeds):
             try:
-                # Convert discord.Embed to dict format for PetParser
                 embed_dict = {
                     "title": embed.title,
                     "description": embed.description,
@@ -642,20 +603,17 @@ class DiscordBot:
                 result = PetParser.parse_embed(embed_dict)
                 server_id = result["server_id"]
                 pet_info_list = result["pet_info_list"]
-                duel_mode = result["duel_mode"]  # NEW
+                duel_mode = result["duel_mode"]  # True / False / None
                 
                 if not server_id or not pet_info_list:
                     continue
                 
-                # Create a separate job for EACH pet found
                 for pet_info in pet_info_list:
                     unique_tracking_id = f"{server_id}_{pet_info.name}"
                     
-                    # Skip if this specific pet+server combo was already processed
                     if self.processed_servers.contains(unique_tracking_id):
                         continue
                     
-                    # Create and add job for this pet
                     job = Job(
                         server_id=server_id,
                         pet_name=pet_info.name,
@@ -665,18 +623,16 @@ class DiscordBot:
                         retry_delay=Config.DEFAULT_RETRY_DELAY,
                         created_time=time.time(),
                         is_priority=pet_info.is_priority,
-                        duel_mode=duel_mode  # NEW
+                        duel_mode=duel_mode  # Pass duel mode into the job
                     )
                     
                     if self.job_queue.add_job(job, unique_tracking_id=unique_tracking_id):
-                        # Broadcast to WebSocket clients
                         broadcast_job_to_ws_clients(job)
                 
             except Exception as e:
                 logger.error(f"❌ Error processing embed {idx + 1}: {e}")
     
     async def start(self):
-        """Start the bot"""
         try:
             await self.bot.start(self.token)
         except Exception as e:
@@ -684,7 +640,6 @@ class DiscordBot:
             self.connected = False
     
     async def close(self):
-        """Close the bot"""
         await self.bot.close()
         self.connected = False
 
@@ -693,11 +648,9 @@ class DiscordBot:
 # Flask API & SocketIO
 # ============================================================================
 
-# Initialize managers
 job_queue_manager = JobQueueManager()
 processed_servers_manager = ProcessedServersManager()
 
-# Flask app
 app = Flask(__name__)
 app.config['SECRET_KEY'] = Config.SECRET_KEY
 
@@ -713,46 +666,35 @@ socketio = SocketIO(
     ping_interval=25
 )
 
-# Client tracking
 active_clients: Set[str] = set()
 client_lock = Lock()
-# Track when each client connected/loaded (to filter out old jobs)
 client_connection_times: Dict[str, float] = {}
 
-# Raw WebSocket endpoint for Roblox executors (using SocketIO's raw WebSocket support)
 @socketio.on('connect', namespace='/ws')
 def handle_raw_ws_connect(auth=None):
-    """Handle raw WebSocket connection for Roblox executors"""
     client_id = request.args.get('client_id') or request.sid
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Only set connection time if not already set (preserve /client_loaded time)
-        # This ensures we use the actual client load time, not WebSocket connect time
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     with ws_clients_lock:
-        ws_clients[client_id] = request.sid  # Store SocketIO session ID
+        ws_clients[client_id] = request.sid
     
     emit('connected', {'status': 'ok', 'client_id': client_id}, namespace='/ws')
     logger.info(f"🔌 Raw WebSocket client connected: {client_id[:8]}... (load time: {client_connection_times.get(client_id, connect_time):.2f})")
     
-    # Send any available job immediately (only jobs created after client loaded)
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
-        emit('job', {
-            "has_job": True,
-            **job.to_dict()
-        }, namespace='/ws')
+        emit('job', {"has_job": True, **job.to_dict()}, namespace='/ws')
     else:
         emit('job', {"has_job": False}, namespace='/ws')
 
 
 @socketio.on('disconnect', namespace='/ws')
 def handle_raw_ws_disconnect():
-    """Handle raw WebSocket disconnection"""
     client_id = request.args.get('client_id') or request.sid
     
     with ws_clients_lock:
@@ -760,48 +702,36 @@ def handle_raw_ws_disconnect():
     
     with client_lock:
         active_clients.discard(client_id)
-        client_connection_times.pop(client_id, None)  # Clean up connection time
+        client_connection_times.pop(client_id, None)
     
     logger.info(f"🔌 Raw WebSocket client disconnected: {client_id[:8]}...")
 
 
 @socketio.on('register', namespace='/ws')
 def handle_raw_ws_register(data):
-    """Handle registration for raw WebSocket clients"""
     client_id = data.get('client_id', request.sid)
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Only set connection time if not already set (preserve /client_loaded time)
-        # This ensures we use the actual client load time, not WebSocket connect time
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     with ws_clients_lock:
         ws_clients[client_id] = request.sid
     
-    emit('registered', {
-        "status": "ok",
-        "client_id": client_id
-    }, namespace='/ws')
-    
+    emit('registered', {"status": "ok", "client_id": client_id}, namespace='/ws')
     logger.info(f"🔌 Raw WebSocket client registered: {client_id[:8]}... (load time: {client_connection_times.get(client_id, connect_time):.2f})")
     
-    # Send any available job immediately (only jobs created after client loaded)
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
-        emit('job', {
-            "has_job": True,
-            **job.to_dict()
-        }, namespace='/ws')
+        emit('job', {"has_job": True, **job.to_dict()}, namespace='/ws')
     else:
         emit('job', {"has_job": False}, namespace='/ws')
 
 
 @socketio.on('clear_job', namespace='/ws')
 def handle_raw_ws_clear_job(data):
-    """Handle job clearing for raw WebSocket clients"""
     client_id = data.get('client_id', request.sid)
     server_id = data.get('server_id')
     
@@ -810,87 +740,65 @@ def handle_raw_ws_clear_job(data):
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared via raw WS: {server_id[:8]}... by {client_id[:8]}...")
         
-        # Send next job if available
         job = job_queue_manager.get_job_for_client(client_id, set())
         if job:
-            emit('job', {
-                "has_job": True,
-                **job.to_dict()
-            }, namespace='/ws')
+            emit('job', {"has_job": True, **job.to_dict()}, namespace='/ws')
         else:
             emit('job', {"has_job": False}, namespace='/ws')
 
 
 @socketio.on('ping', namespace='/ws')
 def handle_raw_ws_ping():
-    """Handle ping from raw WebSocket clients"""
     emit('pong', {}, namespace='/ws')
 
 
-# SocketIO namespace for job distribution (SocketIO protocol)
 @socketio.on('connect', namespace='/jobs')
 def handle_jobs_connect(auth):
-    """Handle connection to /jobs namespace"""
     client_id = auth.get('client_id', request.sid) if auth else request.sid
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Only set connection time if not already set (preserve /client_loaded time)
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     with jobs_clients_lock:
-        jobs_clients[client_id] = request.sid  # Store session ID for /jobs namespace
+        jobs_clients[client_id] = request.sid
     
     emit('connected', {'status': 'ok', 'client_id': client_id}, namespace='/jobs')
     logger.info(f"🔌 Client connected to /jobs namespace: {client_id[:8]}... (load time: {client_connection_times.get(client_id, connect_time):.2f})")
     
-    # Send any available job immediately (only jobs created after client loaded)
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
-        emit('job', {
-            "has_job": True,
-            **job.to_dict()
-        }, namespace='/jobs')
+        emit('job', {"has_job": True, **job.to_dict()}, namespace='/jobs')
     else:
         emit('job', {"has_job": False}, namespace='/jobs')
 
 
 @socketio.on('register', namespace='/jobs')
 def handle_jobs_register(data):
-    """Handle registration in /jobs namespace"""
     client_id = data.get('client_id', request.sid)
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Only set connection time if not already set (preserve /client_loaded time)
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     with jobs_clients_lock:
-        jobs_clients[client_id] = request.sid  # Store session ID for /jobs namespace
+        jobs_clients[client_id] = request.sid
     
-    emit('registered', {
-        "status": "ok",
-        "client_id": client_id
-    }, namespace='/jobs')
+    emit('registered', {"status": "ok", "client_id": client_id}, namespace='/jobs')
     
-    # Send any available job immediately (only jobs created after client loaded)
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
-        emit('job', {
-            "has_job": True,
-            **job.to_dict()
-        }, namespace='/jobs')
+        emit('job', {"has_job": True, **job.to_dict()}, namespace='/jobs')
     else:
         emit('job', {"has_job": False}, namespace='/jobs')
 
 
 @socketio.on('clear_job', namespace='/jobs')
 def handle_jobs_clear_job(data):
-    """Handle job clearing in /jobs namespace"""
     client_id = data.get('client_id', request.sid)
     server_id = data.get('server_id')
     
@@ -899,69 +807,23 @@ def handle_jobs_clear_job(data):
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared via WS: {server_id[:8]}... by {client_id[:8]}...")
         
-        # Send next job if available
         job = job_queue_manager.get_job_for_client(client_id, set())
         if job:
-            emit('job', {
-                "has_job": True,
-                **job.to_dict()
-            }, namespace='/jobs')
+            emit('job', {"has_job": True, **job.to_dict()}, namespace='/jobs')
         else:
             emit('job', {"has_job": False}, namespace='/jobs')
 
 
 @app.route('/ws', methods=['GET'])
 def ws_upgrade():
-    """WebSocket upgrade endpoint - Railway will handle the upgrade"""
-    # This route exists to help Railway identify WebSocket endpoints
-    # Actual WebSocket handling is done via Flask-SocketIO
     return jsonify({
         "status": "websocket_endpoint",
         "message": "Use SocketIO endpoint: /socket.io/?transport=websocket&EIO=4&namespace=/ws"
-    }), 426  # 426 Upgrade Required
+    }), 426
 
 
-# Peer registry: job_id -> set of client_ids in that server
-peer_registry: Dict[str, Set[str]] = {}
-peer_registry_lock = Lock()
-
-
-@app.route('/register_peer', methods=['GET', 'POST'])
-def register_peer():
-    """Register a client as being in a specific Roblox server"""
-    client_id = request.args.get('client_id', 'unknown')
-    job_id = request.args.get('job_id', '')
-
-    if not job_id:
-        return jsonify({"status": "error", "message": "job_id required"}), 400
-
-    with peer_registry_lock:
-        if job_id not in peer_registry:
-            peer_registry[job_id] = set()
-        peer_registry[job_id].add(client_id)
-
-    return jsonify({"status": "ok", "job_id": job_id, "client_id": client_id})
-
-
-@app.route('/get_peers', methods=['GET'])
-def get_peers():
-    """Get all client IDs in the same Roblox server (job_id), excluding the requester"""
-    client_id = request.args.get('client_id', 'unknown')
-    job_id = request.args.get('job_id', '')
-
-    if not job_id:
-        return jsonify({"status": "error", "message": "job_id required"}), 400
-
-    with peer_registry_lock:
-        all_in_server = peer_registry.get(job_id, set())
-        peers = [cid for cid in all_in_server if cid != client_id]
-
-    return jsonify({"peers": peers, "job_id": job_id})
-
-
-
+@app.route('/get_job', methods=['GET'])
 def get_job():
-    """Get next job for client (only jobs created after client loaded)"""
     client_id = request.args.get('client_id', 'unknown')
     since = float(request.args.get('since', 0))
     connect_time = time.time()
@@ -969,29 +831,21 @@ def get_job():
     with client_lock:
         active_clients.add(client_id)
         if since > 0:
-            # Always trust the client's reported load time - survives server restarts
             client_connection_times[client_id] = since
         elif client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
-    job = job_queue_manager.get_job_for_client(
-        client_id,
-        set()  # processed_servers handled internally
-    )
+    job = job_queue_manager.get_job_for_client(client_id, set())
     
     if job:
-        logger.info(f"📤 Sending job to {client_id[:8]}...: {job.pet_name}")
-        return jsonify({
-            "has_job": True,
-            **job.to_dict()
-        })
+        logger.info(f"📤 Sending job to {client_id[:8]}...: {job.pet_name} | {job.format_duel()}")
+        return jsonify({"has_job": True, **job.to_dict()})
     
     return jsonify({"has_job": False})
 
 
-@app.route('/clear_job', methods=['GET', 'POST'])
+@app.route('/clear_job', methods=['POST'])
 def clear_job():
-    """Mark job as completed"""
     client_id = request.args.get('client_id', 'unknown')
     server_id = request.args.get('server_id')
     
@@ -1000,22 +854,16 @@ def clear_job():
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared: {server_id[:8]}... by {client_id[:8]}...")
     
-    return jsonify({
-        "status": "cleared",
-        "queue_size": job_queue_manager.size()
-    })
+    return jsonify({"status": "cleared", "queue_size": job_queue_manager.size()})
 
 
 @app.route('/client_loaded', methods=['POST'])
 def client_loaded():
-    """Mark client as loaded - prevents receiving old/stale jobs"""
     client_id = request.args.get('client_id', 'unknown')
     load_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # ALWAYS update load time (even if already set) - this is when client actually loaded
-        # This ensures we skip ALL jobs created before this time
         client_connection_times[client_id] = load_time
     
     logger.info(f"✅ Client loaded: {client_id[:8]}... (load time: {load_time:.2f}) - Will skip ALL jobs created before this time")
@@ -1024,17 +872,12 @@ def client_loaded():
 
 @app.route('/get_client_ids', methods=['GET'])
 def get_client_ids():
-    """Get all active client IDs"""
     with client_lock:
-        return jsonify({
-            "client_ids": list(active_clients),
-            "count": len(active_clients)
-        })
+        return jsonify({"client_ids": list(active_clients), "count": len(active_clients)})
 
 
 @app.route('/status', methods=['GET'])
 def status():
-    """Get system status"""
     queue_stats = job_queue_manager.get_stats()
     
     with client_lock:
@@ -1052,7 +895,6 @@ def status():
 
 @app.route('/', methods=['GET'])
 def home():
-    """Health check"""
     return jsonify({
         "status": "online",
         "service": "Discord Bot",
@@ -1062,7 +904,6 @@ def home():
 
 @socketio.on('connect')
 def handle_connect(auth=None):
-    """Handle SocketIO connection"""
     client_id = auth.get('client_id', request.sid) if auth and isinstance(auth, dict) else request.sid
     connect_time = time.time()
     
@@ -1076,30 +917,24 @@ def handle_connect(auth=None):
 
 @socketio.on('get_job')
 def handle_get_job(data):
-    """Handle job request via SocketIO (only jobs created after client connected)"""
     client_id = data.get('client_id', 'unknown')
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Set connection time if not already set
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     job = job_queue_manager.get_job_for_client(client_id, set())
     
     if job:
-        emit('job_response', {
-            "has_job": True,
-            **job.to_dict()
-        })
+        emit('job_response', {"has_job": True, **job.to_dict()})
     else:
         emit('job_response', {"has_job": False})
 
 
 @socketio.on('register')
 def handle_register(data):
-    """Handle WebSocket client registration"""
     client_id = data.get('client_id', 'unknown')
     connect_time = time.time()
     
@@ -1107,25 +942,17 @@ def handle_register(data):
         active_clients.add(client_id)
         client_connection_times[client_id] = connect_time
     
-    emit('registered', {
-        "status": "ok",
-        "client_id": client_id
-    })
+    emit('registered', {"status": "ok", "client_id": client_id})
     
-    # Send any available job immediately (only jobs created after connection)
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
-        emit('job', {
-            "has_job": True,
-            **job.to_dict()
-        })
+        emit('job', {"has_job": True, **job.to_dict()})
     else:
         emit('job', {"has_job": False})
 
 
 @socketio.on('clear_job')
 def handle_clear_job(data):
-    """Handle job clearing via SocketIO"""
     client_id = data.get('client_id', 'unknown')
     server_id = data.get('server_id')
     
@@ -1134,41 +961,27 @@ def handle_clear_job(data):
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared via WS: {server_id[:8]}... by {client_id[:8]}...")
         
-        # Send next job if available
         job = job_queue_manager.get_job_for_client(client_id, set())
         if job:
-            emit('job', {
-                "has_job": True,
-                **job.to_dict()
-            })
+            emit('job', {"has_job": True, **job.to_dict()})
         else:
             emit('job', {"has_job": False})
 
 
 # ============================================================================
-# WebSocket Server for Job Distribution
+# WebSocket Broadcasting
 # ============================================================================
 
-# Removed handle_websocket_client - using Flask-SocketIO instead
-
-
-# WebSocket event loop for broadcasting
 ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
-
-# WebSocket clients for raw WebSocket connections (using SocketIO session IDs)
-ws_clients: Dict[str, str] = {}  # client_id -> session_id (for /ws namespace)
-jobs_clients: Dict[str, str] = {}  # client_id -> session_id (for /jobs namespace)
+ws_clients: Dict[str, str] = {}
+jobs_clients: Dict[str, str] = {}
 ws_clients_lock = Lock()
 jobs_clients_lock = Lock()
 
 def broadcast_job_to_ws_clients(job: Job):
     """Broadcast new job to WebSocket clients (ONLY clients who loaded BEFORE job was created)"""
-    job_data = {
-        "has_job": True,
-        **job.to_dict()
-    }
+    job_data = {"has_job": True, **job.to_dict()}
     
-    # Filter: Only send to clients who loaded BEFORE this job was created
     with client_lock:
         eligible_clients = []
         for client_id, load_time in client_connection_times.items():
@@ -1179,7 +992,6 @@ def broadcast_job_to_ws_clients(job: Job):
             logger.info(f"⏭️ Skipping job broadcast: No eligible clients (job created: {job.created_time:.2f}, clients: {len(client_connection_times)})")
             return
     
-    # Send to eligible clients only (not broadcast=True, send individually)
     with ws_clients_lock:
         sent_count = 0
         for client_id in eligible_clients:
@@ -1191,7 +1003,6 @@ def broadcast_job_to_ws_clients(job: Job):
                 except Exception as e:
                     logger.warning(f"Failed to send job to client {client_id[:8]}...: {e}")
     
-    # Send to eligible clients in /jobs namespace
     jobs_sent_count = 0
     with jobs_clients_lock:
         for client_id in eligible_clients:
@@ -1203,20 +1014,16 @@ def broadcast_job_to_ws_clients(job: Job):
                 except Exception as e:
                     logger.warning(f"Failed to send job to /jobs client {client_id[:8]}...: {e}")
     
-    logger.info(f"📤 Broadcasted job to {sent_count} eligible WS clients (/ws) + {jobs_sent_count} (/jobs): {job.pet_name} (created: {job.created_time:.2f})")
+    logger.info(f"📤 Broadcasted job to {sent_count} eligible WS clients (/ws) + {jobs_sent_count} (/jobs): {job.pet_name} | {job.format_duel()} (created: {job.created_time:.2f})")
 
 
 def run_websocket_server():
-    """Run raw WebSocket server integrated with Flask (same port)"""
     global ws_event_loop
-    
-    # Create event loop for WebSocket server
     ws_event_loop = asyncio.new_event_loop()
     
     async def ws_server():
         logger.info(f"🔌 WebSocket support via Flask-SocketIO on port {Config.PORT}")
     
-    # Run in background thread
     def run_loop():
         asyncio.set_event_loop(ws_event_loop)
         ws_event_loop.run_until_complete(ws_server())
@@ -1233,7 +1040,6 @@ discord_bot: Optional[DiscordBot] = None
 
 
 def run_flask():
-    """Run Flask server with SocketIO"""
     socketio.run(
         app,
         host='0.0.0.0',
@@ -1246,7 +1052,6 @@ def run_flask():
 
 
 def run_discord_bot():
-    """Run Discord bot in asyncio loop"""
     global discord_bot
     
     discord_bot = DiscordBot(
@@ -1264,10 +1069,8 @@ if __name__ == "__main__":
         logger.error("❌ DISCORD_TOKEN environment variable not set!")
         exit(1)
     
-    # Initialize WebSocket event loop (for future use if needed)
     run_websocket_server()
     
-    # Start Flask (includes SocketIO WebSocket support)
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
@@ -1277,5 +1080,4 @@ if __name__ == "__main__":
     logger.info(f"   SocketIO endpoint: wss://idek-production.up.railway.app/socket.io/?transport=websocket&EIO=4&namespace=/jobs")
     logger.info("⏳ Starting Discord Bot...\n")
     
-    # Run Discord bot (blocking)
     run_discord_bot()
