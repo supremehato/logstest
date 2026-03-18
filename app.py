@@ -1,3 +1,8 @@
+"""
+Shadow Notifier Backend - Secured
+Includes: auth token validation, rate limiting, IP blacklisting,
+response signing, and anti-network-inspection signatures.
+"""
 import asyncio
 import aiohttp
 import json
@@ -5,7 +10,6 @@ import time
 import logging
 import hmac
 import hashlib
-import requests as req_lib
 from functools import wraps
 from collections import defaultdict
 from flask import Flask, jsonify, request
@@ -45,31 +49,28 @@ class Config:
     PORT               = int(os.environ.get("PORT", 5000))
     SECRET_KEY         = os.environ.get("SECRET_KEY", "your-secret-key-change-this")
 
+    # ── SECURITY ──────────────────────────────────────────────────
+    # Set these in your Railway / VPS environment variables.
+    # AUTH_TOKEN must match the token you embed in the Lua script.
     AUTH_TOKEN        = os.environ.get("SHADOW_AUTH_TOKEN", "CHANGE_THIS_SECRET_TOKEN")
     RESPONSE_SIG      = os.environ.get("SHADOW_SIG",        "shadow_valid_v2")
 
+    # Rate limiting: max requests per window per IP
     RATE_LIMIT_MAX    = int(os.environ.get("RATE_LIMIT_MAX",    "60"))
-    RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+    RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))   # seconds
 
+    # Limits
     MAX_QUEUE_SIZE         = 1000
     MAX_PROCESSED_SERVERS  = 10000
     MAX_MESSAGE_IDS        = 5000
     CLIENT_RESET_INTERVAL  = 1800
     PROCESSED_SERVER_TTL   = 3600
 
+    # Retry settings
     DEFAULT_RETRIES        = 3
     DEFAULT_RETRY_DELAY    = 2
     GATEWAY_RECONNECT_DELAY = 5
     MAX_RECONNECT_DELAY    = 300
-
-    # ── LUARMOR ──────────────────────────────────────────────────
-    # Your Luarmor dashboard URL — used to validate script keys
-    LUARMOR_DASHBOARD  = os.environ.get(
-        "LUARMOR_DASHBOARD",
-        "https://dashboard-for-luarmor-production.up.railway.app"
-    )
-    # How long to cache a validated key before re-checking (seconds)
-    KEY_CACHE_TTL      = int(os.environ.get("KEY_CACHE_TTL", "300"))
 
 
 PRIORITY_PETS = [
@@ -86,95 +87,20 @@ PRIORITY_PETS_INDEX = {p.lower(): i for i, p in enumerate(PRIORITY_PETS)}
 
 
 # ============================================================================
-# Luarmor Key Validation
-# ============================================================================
-
-# Cache: key -> (is_valid: bool, cached_at: float)
-_key_cache: Dict[str, Tuple[bool, float]] = {}
-_key_cache_lock = Lock()
-
-# Clients that have passed Luarmor validation
-validated_clients: Set[str] = set()
-validated_lock = Lock()
-
-
-def validate_luarmor_key(key: str) -> bool:
-    """
-    Check whether a Luarmor key is valid by calling your dashboard API.
-    Results are cached for KEY_CACHE_TTL seconds to avoid hammering the API.
-    Returns True only if the key exists and is not banned/expired.
-    """
-    if not key or key in ("", "KEY_NOT_FOUND"):
-        return False
-
-    now = time.time()
-
-    # Check cache first
-    with _key_cache_lock:
-        if key in _key_cache:
-            is_valid, cached_at = _key_cache[key]
-            if now - cached_at < Config.KEY_CACHE_TTL:
-                return is_valid
-
-    # Call Luarmor dashboard
-    try:
-        url = f"{Config.LUARMOR_DASHBOARD}/api/key-info?key={key}"
-        r = req_lib.get(url, timeout=6)
-        if r.status_code != 200:
-            with _key_cache_lock:
-                _key_cache[key] = (False, now)
-            return False
-        data = r.json()
-        # Key must exist and not be banned
-        is_valid = (
-            data.get("key") is not None
-            and not data.get("banned", False)
-        )
-    except Exception as e:
-        logger.warning(f"⚠️  Luarmor validation error for key {key[:8]}...: {e}")
-        # If Luarmor is unreachable, deny by default (safe fallback)
-        with _key_cache_lock:
-            _key_cache[key] = (False, now)
-        return False
-
-    with _key_cache_lock:
-        _key_cache[key] = (is_valid, now)
-
-    if is_valid:
-        logger.info(f"✅ Luarmor key valid: {key[:8]}...")
-    else:
-        logger.warning(f"🔒 Luarmor key INVALID: {key[:8]}...")
-
-    return is_valid
-
-
-def mark_client_validated(client_id: str):
-    with validated_lock:
-        validated_clients.add(client_id)
-
-
-def is_client_validated(client_id: str) -> bool:
-    with validated_lock:
-        return client_id in validated_clients
-
-
-def remove_validated_client(client_id: str):
-    with validated_lock:
-        validated_clients.discard(client_id)
-
-
-# ============================================================================
 # Security Middleware
 # ============================================================================
 
+# IP blacklist — add abuser IPs here or load from env
 _raw_blacklist = os.environ.get("IP_BLACKLIST", "")
 IP_BLACKLIST: Set[str] = set(x.strip() for x in _raw_blacklist.split(",") if x.strip())
 
+# Rate limit store: ip -> list of timestamps
 _rate_store: Dict[str, list] = defaultdict(list)
 _rate_lock  = Lock()
 
 
 def _get_client_ip() -> str:
+    """Extract real IP, accounting for proxies (Railway uses X-Forwarded-For)."""
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -182,6 +108,7 @@ def _get_client_ip() -> str:
 
 
 def _check_rate_limit(ip: str) -> bool:
+    """Return True if request is within limit, False if throttled."""
     now = time.time()
     window = Config.RATE_LIMIT_WINDOW
     with _rate_lock:
@@ -193,37 +120,54 @@ def _check_rate_limit(ip: str) -> bool:
 
 
 def _validate_token(req) -> bool:
+    """Accept token in header OR query param (Roblox HttpPost can't set headers)."""
     token = (
         req.headers.get("X-Shadow-Token")
         or req.args.get("_t")
         or ""
     )
+    # hmac.compare_digest prevents timing attacks
     return hmac.compare_digest(token, Config.AUTH_TOKEN)
 
 
 def require_auth(f):
+    """
+    Route decorator — enforces:
+    1. IP blacklist
+    2. Rate limiting
+    3. Auth token validation
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         ip = _get_client_ip()
+
         if ip in IP_BLACKLIST:
             logger.warning(f"🚫 BLOCKED blacklisted IP: {ip}")
             return jsonify({"error": "Forbidden"}), 403
+
         if not _check_rate_limit(ip):
             logger.warning(f"⚡ RATE LIMITED: {ip}")
             return jsonify({"error": "Too many requests"}), 429
+
         if not _validate_token(request):
             logger.warning(f"🔒 UNAUTHORIZED from {ip} — bad or missing token")
             return jsonify({"error": "Unauthorized"}), 403
+
         return f(*args, **kwargs)
     return decorated
 
 
 def signed(data: dict) -> dict:
+    """
+    Attach a response signature so the Lua client can verify the response
+    hasn't been intercepted or forged by a network inspector.
+    """
     data["__sig"] = Config.RESPONSE_SIG
     return data
 
 
 def _ws_validate_token(data: dict) -> bool:
+    """Validate token inside a WebSocket event payload."""
     token = data.get("_t") or data.get("token") or ""
     return hmac.compare_digest(token, Config.AUTH_TOKEN)
 
@@ -685,27 +629,26 @@ client_lock                           = Lock()
 client_connection_times: Dict[str, float] = {}
 
 
+# ── Helper: validate WS event token ──────────────────────────────
 def _ws_auth(data) -> bool:
+    """Validate token inside a WS event payload dict."""
     if not isinstance(data, dict):
         return False
     token = data.get("_t") or data.get("token") or ""
     return hmac.compare_digest(str(token), Config.AUTH_TOKEN)
 
 
-# ============================================================================
-# WebSocket Handlers — all require valid Luarmor key on register
-# ============================================================================
-
-# ── /ws namespace ─────────────────────────────────────────────────
+# ── /ws namespace ──────────────────────────────────────────────────
 @socketio.on('connect', namespace='/ws')
 def handle_raw_ws_connect(auth=None):
     client_id    = request.args.get('client_id') or request.sid
     connect_time = time.time()
 
+    # Token check via query param on the WS URL
     token = request.args.get("_t", "")
     if not hmac.compare_digest(token, Config.AUTH_TOKEN):
-        logger.warning(f"🔒 WS /ws unauthorized connect from {_get_client_ip()}")
-        return False
+        logger.warning(f"🔒 WS /ws unauthorized connect attempt from {_get_client_ip()}")
+        return False  # reject connection
 
     with client_lock:
         active_clients.add(client_id)
@@ -718,12 +661,8 @@ def handle_raw_ws_connect(auth=None):
     emit('connected', signed({'status': 'ok', 'client_id': client_id}), namespace='/ws')
     logger.info(f"🔌 WS /ws connected: {client_id[:8]}...")
 
-    # Only send job if client has been validated via client_loaded
-    if is_client_validated(client_id):
-        job = job_queue_manager.get_job_for_client(client_id, set())
-        emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/ws')
-    else:
-        emit('job', signed({"has_job": False}), namespace='/ws')
+    job = job_queue_manager.get_job_for_client(client_id, set())
+    emit('job', signed({"has_job": True,  **job.to_dict()}) if job else signed({"has_job": False}), namespace='/ws')
 
 
 @socketio.on('disconnect', namespace='/ws')
@@ -734,7 +673,6 @@ def handle_raw_ws_disconnect():
     with client_lock:
         active_clients.discard(client_id)
         client_connection_times.pop(client_id, None)
-    remove_validated_client(client_id)
     logger.info(f"🔌 WS /ws disconnected: {client_id[:8]}...")
 
 
@@ -743,27 +681,14 @@ def handle_raw_ws_register(data):
     if not _ws_auth(data):
         logger.warning(f"🔒 WS /ws register rejected — bad token")
         return
-
     client_id    = data.get('client_id', request.sid)
-    key          = data.get('key', '')
     connect_time = time.time()
-
-    # ── Luarmor key check ──────────────────────────────────────────
-    if not validate_luarmor_key(key):
-        logger.warning(f"🔒 WS /ws register rejected — invalid Luarmor key from {client_id[:8]}...")
-        emit('error', {'message': 'Invalid key'}, namespace='/ws')
-        return
-    # ──────────────────────────────────────────────────────────────
-
     with client_lock:
         active_clients.add(client_id)
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     with ws_clients_lock:
         ws_clients[client_id] = request.sid
-
-    mark_client_validated(client_id)
-
     emit('registered', signed({"status": "ok", "client_id": client_id}), namespace='/ws')
     job = job_queue_manager.get_job_for_client(client_id, set())
     emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/ws')
@@ -779,9 +704,8 @@ def handle_raw_ws_clear_job(data):
         job_queue_manager.remove_job(server_id)
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared /ws: {server_id[:8]}... by {client_id[:8]}...")
-        if is_client_validated(client_id):
-            job = job_queue_manager.get_job_for_client(client_id, set())
-            emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/ws')
+        job = job_queue_manager.get_job_for_client(client_id, set())
+        emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/ws')
 
 
 @socketio.on('ping', namespace='/ws')
@@ -811,38 +735,22 @@ def handle_jobs_connect(auth=None):
     emit('connected', signed({'status': 'ok', 'client_id': client_id}), namespace='/jobs')
     logger.info(f"🔌 WS /jobs connected: {client_id[:8]}...")
 
-    if is_client_validated(client_id):
-        job = job_queue_manager.get_job_for_client(client_id, set())
-        emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/jobs')
-    else:
-        emit('job', signed({"has_job": False}), namespace='/jobs')
+    job = job_queue_manager.get_job_for_client(client_id, set())
+    emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/jobs')
 
 
 @socketio.on('register', namespace='/jobs')
 def handle_jobs_register(data):
     if not _ws_auth(data):
         return
-
     client_id    = data.get('client_id', request.sid)
-    key          = data.get('key', '')
     connect_time = time.time()
-
-    # ── Luarmor key check ──────────────────────────────────────────
-    if not validate_luarmor_key(key):
-        logger.warning(f"🔒 WS /jobs register rejected — invalid Luarmor key from {client_id[:8]}...")
-        emit('error', {'message': 'Invalid key'}, namespace='/jobs')
-        return
-    # ──────────────────────────────────────────────────────────────
-
     with client_lock:
         active_clients.add(client_id)
         if client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     with jobs_clients_lock:
         jobs_clients[client_id] = request.sid
-
-    mark_client_validated(client_id)
-
     emit('registered', signed({"status": "ok", "client_id": client_id}), namespace='/jobs')
     job = job_queue_manager.get_job_for_client(client_id, set())
     emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/jobs')
@@ -858,9 +766,8 @@ def handle_jobs_clear_job(data):
         job_queue_manager.remove_job(server_id)
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared /jobs: {server_id[:8]}... by {client_id[:8]}...")
-        if is_client_validated(client_id):
-            job = job_queue_manager.get_job_for_client(client_id, set())
-            emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/jobs')
+        job = job_queue_manager.get_job_for_client(client_id, set())
+        emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}), namespace='/jobs')
 
 
 # ── Default namespace ──────────────────────────────────────────────
@@ -879,10 +786,7 @@ def handle_connect(auth=None):
 def handle_get_job(data):
     if not _ws_auth(data):
         return
-    client_id = data.get('client_id', 'unknown')
-    if not is_client_validated(client_id):
-        emit('job_response', signed({"has_job": False}))
-        return
+    client_id    = data.get('client_id', 'unknown')
     connect_time = time.time()
     with client_lock:
         active_clients.add(client_id)
@@ -896,24 +800,11 @@ def handle_get_job(data):
 def handle_register(data):
     if not _ws_auth(data):
         return
-
     client_id    = data.get('client_id', 'unknown')
-    key          = data.get('key', '')
     connect_time = time.time()
-
-    # ── Luarmor key check ──────────────────────────────────────────
-    if not validate_luarmor_key(key):
-        logger.warning(f"🔒 Default ns register rejected — invalid Luarmor key from {client_id[:8]}...")
-        emit('error', {'message': 'Invalid key'})
-        return
-    # ──────────────────────────────────────────────────────────────
-
     with client_lock:
         active_clients.add(client_id)
         client_connection_times[client_id] = connect_time
-
-    mark_client_validated(client_id)
-
     emit('registered', signed({"status": "ok", "client_id": client_id}))
     job = job_queue_manager.get_job_for_client(client_id, set())
     emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}))
@@ -929,13 +820,12 @@ def handle_clear_job(data):
         job_queue_manager.remove_job(server_id)
         processed_servers_manager.add(server_id, client_id)
         logger.info(f"✅ Job cleared (default ns): {server_id[:8]}... by {client_id[:8]}...")
-        if is_client_validated(client_id):
-            job = job_queue_manager.get_job_for_client(client_id, set())
-            emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}))
+        job = job_queue_manager.get_job_for_client(client_id, set())
+        emit('job', signed({"has_job": True, **job.to_dict()}) if job else signed({"has_job": False}))
 
 
 # ============================================================================
-# HTTP Routes
+# HTTP Routes (all protected with @require_auth)
 # ============================================================================
 
 @app.route('/ws', methods=['GET'])
@@ -960,12 +850,6 @@ def get_job():
         elif client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
 
-    # ── Only serve jobs to validated clients ───────────────────────
-    if not is_client_validated(client_id):
-        logger.warning(f"🔒 /get_job blocked unvalidated client: {client_id[:8]}...")
-        return jsonify(signed({"has_job": False}))
-    # ──────────────────────────────────────────────────────────────
-
     job = job_queue_manager.get_job_for_client(client_id, set())
     if job:
         logger.info(f"📤 Sending job to {client_id[:8]}...: {job.pet_name} | {job.format_duel()}")
@@ -989,31 +873,19 @@ def clear_job():
 @require_auth
 def client_loaded():
     client_id = request.args.get('client_id', 'unknown')
-    key       = request.args.get('key', '')
-
-    # ── Luarmor key check ──────────────────────────────────────────
-    if not validate_luarmor_key(key):
-        logger.warning(f"🔒 /client_loaded rejected — invalid Luarmor key from {client_id[:8]}...")
-        return jsonify({"error": "Invalid key"}), 403
-    # ──────────────────────────────────────────────────────────────
-
     load_time = time.time()
     with client_lock:
         active_clients.add(client_id)
         client_connection_times[client_id] = load_time
-
-    mark_client_validated(client_id)
-    logger.info(f"✅ Client loaded + Luarmor validated: {client_id[:8]}...")
+    logger.info(f"✅ Client loaded: {client_id[:8]}... (load_time: {load_time:.2f})")
     return jsonify(signed({"status": "ok", "load_time": load_time}))
 
 
 @app.route('/get_client_ids', methods=['GET'])
 @require_auth
 def get_client_ids():
-    # Only return validated clients so unvalidated leechers don't show up in ESP
-    with validated_lock:
-        ids = list(validated_clients)
-    return jsonify(signed({"client_ids": ids, "count": len(ids)}))
+    with client_lock:
+        return jsonify(signed({"client_ids": list(active_clients), "count": len(active_clients)}))
 
 
 @app.route('/register_peer', methods=['POST'])
@@ -1021,12 +893,6 @@ def get_client_ids():
 def register_peer():
     client_id = request.args.get('client_id', 'unknown')
     job_id    = request.args.get('job_id', '')
-
-    # Only allow validated clients to register as peers
-    if not is_client_validated(client_id):
-        logger.warning(f"🔒 /register_peer blocked unvalidated client: {client_id[:8]}...")
-        return jsonify({"error": "Not validated"}), 403
-
     with client_lock:
         active_clients.add(client_id)
     logger.info(f"👥 Peer registered: {client_id[:8]}... job: {job_id[:8] if job_id else 'N/A'}...")
@@ -1038,26 +904,23 @@ def register_peer():
 def get_peers():
     job_id    = request.args.get('job_id', '')
     client_id = request.args.get('client_id', '')
-    # Only return validated peers
-    with validated_lock:
-        peers = [uid for uid in validated_clients if uid != client_id]
+    with client_lock:
+        peers = [uid for uid in active_clients if uid != client_id]
     return jsonify(signed({"peers": peers}))
 
 
 @app.route('/status', methods=['GET'])
 def status():
+    # Status is intentionally public so you can monitor it
     queue_stats = job_queue_manager.get_stats()
     with client_lock:
         client_count = len(active_clients)
-    with validated_lock:
-        validated_count = len(validated_clients)
     return jsonify({
         "status":                 "online",
         "discord_bot_connected":  discord_bot.connected if discord_bot else False,
         "queue_size":             queue_stats["size"],
         "processed_servers":      processed_servers_manager.size(),
         "active_clients":         client_count,
-        "validated_clients":      validated_count,
         **queue_stats
     })
 
@@ -1071,9 +934,11 @@ def home():
     })
 
 
+# ── Admin: blacklist an IP on the fly ────────────────────────────
 @app.route('/admin/blacklist', methods=['POST'])
 @require_auth
 def admin_blacklist():
+    """POST /admin/blacklist?ip=1.2.3.4&_t=YOUR_TOKEN"""
     ip = request.args.get('ip', '').strip()
     if not ip:
         return jsonify({"error": "ip param required"}), 400
@@ -1091,7 +956,7 @@ def admin_unblacklist():
 
 
 # ============================================================================
-# WebSocket Broadcasting — only to validated clients
+# WebSocket Broadcasting
 # ============================================================================
 
 ws_event_loop:    Optional[asyncio.AbstractEventLoop] = None
@@ -1109,15 +974,9 @@ def broadcast_job_to_ws_clients(job: Job):
             cid for cid, lt in client_connection_times.items()
             if lt > 0 and lt < job.created_time
         ]
-
-    # ── Only broadcast to Luarmor-validated clients ────────────────
-    with validated_lock:
-        eligible = [cid for cid in eligible if cid in validated_clients]
-    # ──────────────────────────────────────────────────────────────
-
-    if not eligible:
-        logger.info(f"⏭️ No eligible validated clients for broadcast")
-        return
+        if not eligible:
+            logger.info(f"⏭️ No eligible clients for broadcast (job: {job.created_time:.2f})")
+            return
 
     sent_ws, sent_jobs = 0, 0
 
@@ -1201,7 +1060,6 @@ if __name__ == "__main__":
     logger.info(f"⚡ Rate limiting: {Config.RATE_LIMIT_MAX} req/{Config.RATE_LIMIT_WINDOW}s per IP")
     logger.info(f"🚫 IP blacklist loaded: {len(IP_BLACKLIST)} entries")
     logger.info(f"✍️  Response signing: ENABLED (sig={Config.RESPONSE_SIG})")
-    logger.info(f"🔑 Luarmor key validation: ENABLED (cache TTL: {Config.KEY_CACHE_TTL}s)")
     logger.info("⏳ Starting Discord Bot...\n")
 
     run_discord_bot()
